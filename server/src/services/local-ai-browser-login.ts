@@ -19,11 +19,27 @@ export type LocalBrowserLoginState = {
 // Node has no built-in PTY API. Python's standard-library pty module supplies
 // the terminal required by both CLIs. The Docker image already includes
 // python3. This bridge forwards only bytes; provider output is never logged.
+//
+// The slave starts at 0 rows by 0 columns unless a size is set before exec.
+// A later resize does not rebuild a frame the process already measured at
+// startup, and it does not answer a terminal-query wait. Set the size on the
+// slave before exec, and again on the master so the size survives platforms
+// that apply it on only one side.
+const LOGIN_PTY_ROWS = 40;
+const LOGIN_PTY_COLS = 120;
 const PYTHON_PTY_BRIDGE = String.raw`
-import errno, os, pty, select, signal, sys
+import errno, fcntl, os, pty, select, signal, struct, sys, termios
 pid, master = pty.fork()
 if pid == 0:
+    try:
+        fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", ${LOGIN_PTY_ROWS}, ${LOGIN_PTY_COLS}, 0, 0))
+    except OSError:
+        pass
     os.execvpe(sys.argv[1], sys.argv[1:], os.environ)
+try:
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", ${LOGIN_PTY_ROWS}, ${LOGIN_PTY_COLS}, 0, 0))
+except OSError:
+    pass
 def stop(_signal, _frame):
     try: os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError: pass
@@ -45,6 +61,20 @@ while True:
 _, status = os.waitpid(pid, 0)
 sys.exit(os.waitstatus_to_exitcode(status))
 `;
+
+async function seedIsolatedOnboarding(home: string): Promise<void> {
+  let file;
+  try {
+    file = await open(path.join(home, ".claude.json"), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  } catch {
+    return;
+  }
+  try {
+    await file.writeFile(`${JSON.stringify({ hasCompletedOnboarding: true })}\n`);
+  } finally {
+    await file.close();
+  }
+}
 
 /** Run the same browser-code login used by sandbox connections on the local host. */
 export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "google", home: string): LocalBrowserLoginState {
@@ -74,13 +104,29 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "googl
         }
       }
       if (controller.signal.aborted) throw new Error("Local sign-in cancelled before launch");
-      const env = { ...process.env,
+      // The theme screen is not the folder-trust check. Record only that the
+      // isolated attempt home has finished onboarding. Never write a project
+      // trust decision, a tool allow-list, or a permission bypass.
+      if (provider === "anthropic") await seedIsolatedOnboarding(home);
+      const env: NodeJS.ProcessEnv = { ...process.env,
         ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "", CLAUDE_CODE_OAUTH_TOKEN: "",
         OPENAI_API_KEY: "", CODEX_API_KEY: "",
         CLAUDE_CONFIG_DIR: provider === "anthropic" ? home : process.env.CLAUDE_CONFIG_DIR,
         CODEX_HOME: provider === "openai" ? home : process.env.CODEX_HOME,
         BROWSER: "true",
       };
+      // Claude waits for replies to terminal queries when TERM is set, and the
+      // bridge never answers those queries. Leave TERM unset for this child.
+      // The mouse hint is not a security prompt. Disabling mouse tracking stops
+      // the builds that honor this variable from printing it. The parser still
+      // accepts the hint when a build prints it anyway.
+      if (provider === "anthropic") {
+        delete env.TERM;
+        delete env.COLORTERM;
+        delete env.TMUX;
+        delete env.TMUX_PANE;
+        env.CLAUDE_CODE_DISABLE_MOUSE = "1";
+      }
       return new Promise((resolve, reject) => {
         child = spawn("python3", ["-u", "-c", PYTHON_PTY_BRIDGE, executable, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
         child.stdout.on("data", (bytes: Buffer) => onData(bytes.toString("utf8")));
@@ -105,6 +151,12 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "googl
     void runSetupTokenLogin(driver, {
       timeoutMs: 300_000, signal: controller.signal,
       onPrompt: (prompt) => { state.authorizationUrl = prompt.url; },
+      onBlocked: (blocker) => {
+        state.error = blocker === "workspace_trust"
+          ? "Claude Code is waiting on its folder trust check. Paperclip does not accept that check for you."
+          : "Claude Code is waiting on its first-run setup screen. Paperclip does not answer that screen for you.";
+        controller.abort();
+      },
       provideCode: (signal) => new Promise<string>((resolve, reject) => {
         const abort = () => reject(new Error("Local sign-in cancelled"));
         if (signal.aborted) { abort(); return; }
