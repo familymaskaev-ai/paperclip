@@ -6,8 +6,10 @@ import {
   type LoginRunnerResult,
 } from "@paperclipai/adapter-utils";
 import {
+  classifySetupTokenBlocker,
   parseSetupTokenCredential,
   parseSetupTokenPrompt,
+  type SetupTokenBlocker,
   type SetupTokenPrompt,
 } from "./setup-token-parse.js";
 
@@ -133,6 +135,12 @@ export interface RunSetupTokenLoginOptions extends LoginRunnerLifecycleOptions {
   command?: string;
   /** Receives the parsed prompt one time in memory. The caller displays it. */
   onPrompt: SetupTokenPromptSink;
+  /**
+   * Receives a fixed blocking-screen kind one time when the transcript has no
+   * sign-in URL. The callback receives no transcript text. The runner does not
+   * answer the screen.
+   */
+  onBlocked?: (blocker: SetupTokenBlocker) => void;
   /** Returns the one browser code. The runner writes it to the matched prompt. */
   provideCode: SetupTokenCodeProvider;
   /**
@@ -201,7 +209,7 @@ export async function runSetupTokenLogin(
   driver: SetupTokenPtyDriver,
   options: RunSetupTokenLoginOptions,
 ): Promise<SetupTokenLoginResult> {
-  const { onPrompt, provideCode, onCredential, timeoutMs, signal } = options;
+  const { onPrompt, onBlocked, provideCode, onCredential, timeoutMs, signal } = options;
   const command = options.command ?? CLAUDE_SETUP_TOKEN_COMMAND;
   const codeSubmitSettleMs = options.codeSubmitSettleMs ?? CODE_SUBMIT_SETTLE_MS;
   const log = options.log ?? (() => {});
@@ -216,6 +224,7 @@ export async function runSetupTokenLogin(
   }
 
   let promptSurfaced = false;
+  let blockerReported = false;
   let codeSubmitted = false;
   let submitStarted = false;
   // The runner sets this true one time, only after the mandatory sink resolves.
@@ -323,6 +332,17 @@ export async function runSetupTokenLogin(
           submitPromise = submitCode();
         }
         return;
+      }
+      if (!blockerReported && onBlocked) {
+        const blocker = classifySetupTokenBlocker(buffer);
+        if (blocker) {
+          blockerReported = true;
+          try {
+            onBlocked(blocker);
+          } catch {
+            log("[paperclip] Setup-token login: the blocking-screen step errored.");
+          }
+        }
       }
       if (buffer.length > CLAUDE_SETUP_TOKEN_MAX_BUFFER_CHARS) {
         buffer = buffer.slice(buffer.length - CLAUDE_SETUP_TOKEN_MAX_BUFFER_CHARS);

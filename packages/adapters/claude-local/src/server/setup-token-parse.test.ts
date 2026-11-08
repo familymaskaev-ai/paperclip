@@ -10,6 +10,7 @@ import {
   SETUP_TOKEN_PROMPT,
   SETUP_TOKEN_REDIRECT_URI,
   SETUP_TOKEN_URL_QUERY_KEYS,
+  classifySetupTokenBlocker,
   parseSetupTokenCredential,
   parseSetupTokenPrompt,
 } from "./setup-token-parse.js";
@@ -345,6 +346,54 @@ describe("parseSetupTokenPrompt", () => {
     expect(result?.prompt).toBe(SETUP_TOKEN_PROMPT);
   });
 
+  it.each(["Shift", "Fn", "Option", "Opt"])("skips a %s native-copy hint between the URL and the prompt", (key) => {
+    const hint = `Hold ${key} while selecting to use your terminal's native copy`;
+    const text = [PREAMBLE_LINE, CLAUDE_COM_URL, "", hint, "", PROMPT_LINE].join("\n");
+    const result = parseSetupTokenPrompt(text);
+    expect(result?.url).toBe(CLAUDE_COM_URL);
+    expect(result?.prompt).toBe(SETUP_TOKEN_PROMPT);
+  });
+
+  it("skips a native-copy hint that wraps the word copy onto the next line", () => {
+    const text = [
+      PREAMBLE_LINE,
+      CLAUDE_COM_URL,
+      "Hold Fn while selecting to use your terminal's native",
+      "copy",
+      "",
+      PROMPT_LINE,
+    ].join("\n");
+    const result = parseSetupTokenPrompt(text);
+    expect(result?.url).toBe(CLAUDE_COM_URL);
+    expect(result?.prompt).toBe(SETUP_TOKEN_PROMPT);
+  });
+
+  it("returns null for a partial copy hint", () => {
+    const text = [PREAMBLE_LINE, CLAUDE_COM_URL, "Hold Fn while selecting", PROMPT_LINE].join("\n");
+    expect(parseSetupTokenPrompt(text)).toBeNull();
+  });
+
+  it("does not treat a folder-trust screen as a sign-in prompt", () => {
+    const text = [
+      "Quick safety check",
+      "Is this a project you created or one you trust?",
+      "1. Yes, I trust this folder",
+      "2. No",
+    ].join("\n");
+    expect(parseSetupTokenPrompt(text)).toBeNull();
+    expect(classifySetupTokenBlocker(text)).toBe("workspace_trust");
+  });
+
+  it("does not treat the first-run theme screen as a sign-in prompt", () => {
+    const text = "Choose the text style that looks best\n1. Dark\n2. Light\n";
+    expect(parseSetupTokenPrompt(text)).toBeNull();
+    expect(classifySetupTokenBlocker(text)).toBe("first_run_onboarding");
+  });
+
+  it("keeps a valid prompt ahead of a blocking-screen phrase", () => {
+    expect(classifySetupTokenBlocker(completeOutput(CLAUDE_COM_URL))).toBeNull();
+  });
+
   it("returns null when a code-like value sits on the line after the URL", () => {
     // The line right after the URL must hold the browser-code prompt. A code-like
     // value on that line cannot bind, so the parser returns null.
@@ -571,6 +620,29 @@ describe("parseSetupTokenCredential", () => {
     const cyan = "\x1b[36m";
     const reset = "\x1b[0m";
     const text = successScreen([`${cyan}${TOKEN_FRAGMENT_A}`, `${TOKEN_FRAGMENT_B}${reset}`]);
+    expect(parseSetupTokenCredential(text)).toBe(FULL_TOKEN);
+  });
+
+  it("reads a success screen whose anchors lost the characters a differential redraw skips", () => {
+    // The bytes omit the "t" in OAuth, the "a" in year, and replace the "o" in
+    // won't with the space a cursor-forward leaves. No real token is present.
+    const before = "Your OAuh token (valid for 1 yer):";
+    const after = "Store this token securely. You w n't be able to see it again.";
+    const text = ["✓ token created", "", before, "", FULL_TOKEN, "", after].join("\n");
+    expect(parseSetupTokenCredential(text)).toBe(FULL_TOKEN);
+  });
+
+  it("returns null when an anchor is more than two edits from the canonical line", () => {
+    const before = "Your OAuh token (valid for 1 ye):";
+    const text = [before, "", FULL_TOKEN, "", SETUP_TOKEN_AFTER_ANCHOR].join("\n");
+    expect(parseSetupTokenCredential(text)).toBeNull();
+  });
+
+  it("keeps a cursor-forward over an already painted anchor character", () => {
+    const after = SETUP_TOKEN_AFTER_ANCHOR;
+    const skipAt = after.indexOf("won't") + 1;
+    const redraw = `${after}\r${after.slice(0, skipAt)}\x1b[${skipAt + 2}G${after.slice(skipAt + 1)}`;
+    const text = [SETUP_TOKEN_BEFORE_ANCHOR, "", FULL_TOKEN, "", redraw].join("\n");
     expect(parseSetupTokenCredential(text)).toBe(FULL_TOKEN);
   });
 

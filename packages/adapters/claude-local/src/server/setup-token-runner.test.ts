@@ -96,6 +96,27 @@ async function flush(): Promise<void> {
 }
 
 describe("runSetupTokenLogin", () => {
+  it("reports a folder-trust screen without surfacing a URL or the transcript", async () => {
+    const fake = createFakeDriver({
+      chunks: ["Quick safety check\nIs this a project you created or one you trust?\n"],
+      exitCode: 0,
+    });
+    const onPrompt = vi.fn();
+    const onBlocked = vi.fn();
+    const result = await runSetupTokenLogin(fake.driver, {
+      onPrompt,
+      onBlocked,
+      provideCode: async () => BROWSER_CODE,
+      timeoutMs: 1000,
+    });
+    expect(result.outcome).toBe("failure");
+    expect(result.promptSurfaced).toBe(false);
+    expect(onPrompt).not.toHaveBeenCalled();
+    expect(onBlocked).toHaveBeenCalledTimes(1);
+    expect(onBlocked).toHaveBeenCalledWith("workspace_trust");
+    expect(JSON.stringify(result)).not.toContain("trust");
+  });
+
   it("sends one login URL through onPrompt", async () => {
     // A success stream and a resolving sink, so the run reports success after the
     // runner delivers the credential.

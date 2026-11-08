@@ -181,9 +181,15 @@ const URL_PREAMBLE_RE = /the url below to sign in/i;
 // the line.
 const PROMPT_LINE_RE = /^Paste code here if prompted\b[\s>*]*$/;
 
-// The copy hint that `claude` 2.1.291 prints between the URL block and the
-// prompt. The parser skips this exact line and binds no value from it.
-const COPY_HINT_LINE_RE = /^Hold\s+Shift\s+while\s+selecting\s+to\s+use\s+your\s+terminal['’]s\s+native\s+copy\.?$/i;
+// The copy hint Claude Code prints between the URL block and the prompt.
+// Linux builds say "Hold Shift". macOS builds of the same flow say "Hold Fn"
+// or "Hold Option". The parser skips this hint, including a short wrap, and
+// binds no value from it. Any other line still fails closed.
+const COPY_HINT_LINE_RE = /^Hold\s+(?:Shift|Fn|Option|Opt)\s+while\s+selecting\s+to\s+use\s+your\s+terminal['’]s\s+native\s+copy\.?$/i;
+
+// The most physical lines a wrapped copy hint may occupy. A narrow wrap of the
+// hint fits in this budget. A longer run is not the hint.
+const MAX_COPY_HINT_LINES = 4;
 
 // The maximum number of characters between the end of the URL preamble line and
 // the start of the URL. The Claude UI prints the URL right after the preamble.
@@ -219,6 +225,122 @@ function stripTerminalControls(text: string): string {
     .replace(OSC_ANY_RE, "")
     .replace(CSI_HORIZONTAL_MOVE_RE, " ")
     .replace(ANSI_CSI_RE, "");
+}
+
+// The screen keeps enough rows and columns for one login transcript. The
+// column cap stays above the authorization URL length cap. A shorter cap would
+// cut a too-long URL down into a URL the validator accepts.
+const SCREEN_MAX_ROWS = 400;
+const SCREEN_MAX_COLS = MAX_URL_LENGTH * 2;
+
+/**
+ * Reads one CSI sequence starting at the `[` of `ESC [`. Returns null when the
+ * sequence does not finish. Private-mode sequences (`ESC [ ? ...`) are marked
+ * so the screen can ignore them.
+ */
+function readCsi(chars: string[], start: number): { end: number; params: number[]; final: string; privateMode: boolean } | null {
+  let index = start + 1;
+  const privateMode = index < chars.length && chars[index] === "?";
+  if (privateMode) index += 1;
+  const params: number[] = [];
+  let current = "";
+  const limit = Math.min(chars.length, start + 48);
+  while (index < limit) {
+    const ch = chars[index];
+    if (ch >= "0" && ch <= "9") {
+      current += ch;
+      index += 1;
+      continue;
+    }
+    if (ch === ";") {
+      params.push(current === "" ? 0 : Number(current));
+      current = "";
+      index += 1;
+      continue;
+    }
+    if (ch >= "@" && ch <= "~") {
+      params.push(current === "" ? 0 : Number(current));
+      return { end: index + 1, params, final: ch, privateMode };
+    }
+    index += 1;
+  }
+  return null;
+}
+
+function moveCount(params: number[], slot: number): number {
+  const value = params[slot] ?? 0;
+  return value === 0 ? 1 : value;
+}
+
+/**
+ * Renders login output onto a terminal screen and returns the visible rows.
+ * Cursor-forward over a cell that already holds a character keeps that
+ * character. Cursor-forward over an empty cell becomes a space when the row
+ * is read back, which preserves word gaps. OSC 8 hyperlinks contribute their
+ * URI, not the wrapped display text. The function does not validate a URL or
+ * a token.
+ */
+function renderTerminalScreen(text: string): string {
+  const source = text.replace(OSC8_HYPERLINK_RE, "$1\n").replace(OSC_ANY_RE, "");
+  const chars = Array.from(source);
+  const rows: string[][] = [];
+  let row = 0;
+  let col = 0;
+
+  const ensure = (index: number): string[] => {
+    while (rows.length <= index) rows.push([]);
+    return rows[index];
+  };
+  const writeChar = (ch: string): void => {
+    if (row >= SCREEN_MAX_ROWS || col >= SCREEN_MAX_COLS) return;
+    const line = ensure(row);
+    while (line.length < col) line.push(" ");
+    line[col] = ch;
+    col += 1;
+  };
+
+  for (let index = 0; index < chars.length; index += 1) {
+    const ch = chars[index];
+    if (ch === "\n") {
+      row = Math.min(SCREEN_MAX_ROWS - 1, row + 1);
+      col = 0;
+      continue;
+    }
+    if (ch === "\r") {
+      col = 0;
+      continue;
+    }
+    if (ch !== "\u001b") {
+      if (ch >= " " || ch === "\t") writeChar(ch === "\t" ? " " : ch);
+      continue;
+    }
+    const next = chars[index + 1];
+    if (next !== "[") {
+      index += next === undefined ? 0 : 1;
+      continue;
+    }
+    const csi = readCsi(chars, index + 1);
+    if (!csi) break;
+    index = csi.end - 1;
+    if (csi.privateMode) continue;
+    if (csi.final === "A") row = Math.max(0, row - moveCount(csi.params, 0));
+    else if (csi.final === "B") row = Math.min(SCREEN_MAX_ROWS - 1, row + moveCount(csi.params, 0));
+    else if (csi.final === "C") col = Math.min(SCREEN_MAX_COLS - 1, col + moveCount(csi.params, 0));
+    else if (csi.final === "D") col = Math.max(0, col - moveCount(csi.params, 0));
+    else if (csi.final === "G") col = Math.max(0, Math.min(SCREEN_MAX_COLS - 1, (csi.params[0] || 1) - 1));
+    else if (csi.final === "H" || csi.final === "f") {
+      row = Math.max(0, Math.min(SCREEN_MAX_ROWS - 1, (csi.params[0] || 1) - 1));
+      col = Math.max(0, Math.min(SCREEN_MAX_COLS - 1, (csi.params[1] || 1) - 1));
+    } else if (csi.final === "K") {
+      const line = ensure(row);
+      const mode = csi.params[0] ?? 0;
+      if (mode === 0) line.splice(col);
+      else if (mode === 1) {
+        for (let cell = 0; cell <= col && cell < line.length; cell += 1) line[cell] = " ";
+      } else if (mode === 2) line.splice(0, line.length);
+    }
+  }
+  return rows.map((line) => line.join("").replace(/[ \t]+$/u, "")).join("\n");
 }
 
 /**
@@ -368,11 +490,23 @@ function reassembleUrl(lines: string[], startLine: number): SetupTokenUrlMatch |
  * end line. The Claude UI can emit one full URL line per wrapped display row, so
  * it repeats the same full authorization URL on a few consecutive lines. The
  * parser skips a line that repeats `url`. The `claude` 2.1.291 UI also prints a
- * copy hint before the prompt, so the parser skips a line that matches {@link
- * COPY_HINT_LINE_RE}. The parser then binds the prompt on the first non-blank
- * line that is not a repeat and not the copy hint. That line must match the
- * exact prompt shape. Returns null when that line is not the prompt.
+ * copy hint before the prompt, so the parser skips a line or a short wrap that
+ * matches {@link COPY_HINT_LINE_RE}. The parser then binds the prompt on the
+ * first non-blank line that is not a repeat and not the copy hint. That line
+ * must match the exact prompt shape. Returns null when that line is not the
+ * prompt.
  */
+function copyHintEnd(lines: string[], start: number): number {
+  const parts: string[] = [];
+  for (let index = start; index < lines.length && parts.length < MAX_COPY_HINT_LINES; index += 1) {
+    const trimmed = lines[index].trim();
+    if (trimmed.length === 0) break;
+    parts.push(trimmed);
+    if (COPY_HINT_LINE_RE.test(parts.join(" "))) return index + 1;
+  }
+  return -1;
+}
+
 function findBrowserCodePrompt(lines: string[], endLine: number, url: string): string | null {
   for (let i = endLine + 1; i < lines.length; i += 1) {
     const trimmed = lines[i].trim();
@@ -381,7 +515,11 @@ function findBrowserCodePrompt(lines: string[], endLine: number, url: string): s
     // punctuation first, the same way the repeated-URL comparison needs, so a
     // repeated URL with a trailing punctuation mark still matches.
     if (trimmed.replace(TRAILING_PUNCTUATION_RE, "") === url) continue;
-    if (COPY_HINT_LINE_RE.test(trimmed)) continue;
+    const hintEnd = copyHintEnd(lines, i);
+    if (hintEnd !== -1) {
+      i = hintEnd - 1;
+      continue;
+    }
     return PROMPT_LINE_RE.test(trimmed) ? SETUP_TOKEN_PROMPT : null;
   }
   return null;
@@ -401,9 +539,7 @@ function findBrowserCodePrompt(lines: string[], endLine: number, url: string): s
  * URL, and a missing or misplaced prompt. Never throws on input, and never puts
  * any input byte into a log or an error. This phase returns no token.
  */
-export function parseSetupTokenPrompt(text: string): SetupTokenPrompt | null {
-  if (typeof text !== "string" || text.length === 0) return null;
-  const clean = stripTerminalControls(text);
+function promptFromPlain(clean: string): SetupTokenPrompt | null {
   const preamble = URL_PREAMBLE_RE.exec(clean);
   if (!preamble) return null;
   const afterPreamble = preamble.index + preamble[0].length;
@@ -425,6 +561,40 @@ export function parseSetupTokenPrompt(text: string): SetupTokenPrompt | null {
     const prompt = findBrowserCodePrompt(lines, match.endLine, match.url);
     if (prompt) return { url: match.url, prompt };
   }
+  return null;
+}
+
+function plainLoginText(text: string): string[] {
+  return [renderTerminalScreen(text), stripTerminalControls(text).replace(/\r\n|\r/g, "\n")];
+}
+
+export function parseSetupTokenPrompt(text: string): SetupTokenPrompt | null {
+  if (typeof text !== "string" || text.length === 0) return null;
+  for (const clean of plainLoginText(text)) {
+    const prompt = promptFromPlain(clean);
+    if (prompt) return prompt;
+  }
+  return null;
+}
+
+// A fresh Claude home can stop on one of these screens before it prints a URL.
+// The classifier returns a fixed kind. It never returns the screen text.
+export type SetupTokenBlocker = "workspace_trust" | "first_run_onboarding";
+
+const WORKSPACE_TRUST_RE = /Quick safety check|Is this a project you created or one you trust/i;
+const FIRST_RUN_ONBOARDING_RE = /Choose the text style that looks best/i;
+
+/**
+ * Classifies a login transcript that has not produced a sign-in URL. Returns
+ * null when the transcript holds a valid prompt, or when it does not match a
+ * known blocking screen. Never returns transcript text.
+ */
+export function classifySetupTokenBlocker(text: string): SetupTokenBlocker | null {
+  if (typeof text !== "string" || text.length === 0) return null;
+  if (parseSetupTokenPrompt(text)) return null;
+  const plain = plainLoginText(text).join("\n");
+  if (WORKSPACE_TRUST_RE.test(plain)) return "workspace_trust";
+  if (FIRST_RUN_ONBOARDING_RE.test(plain)) return "first_run_onboarding";
   return null;
 }
 
@@ -455,15 +625,53 @@ const TOKEN_FRAGMENT_RE = /^[A-Za-z0-9_-]+$/;
 // opaque tail is far longer than this floor.
 const FULL_TOKEN_RE = /^sk-ant-oat01-[A-Za-z0-9_-]{20,}$/;
 
+// Differential redraws omit one or two characters that are already on screen.
+// After a cursor-forward is removed, the visible anchor can differ from the
+// canonical line by that many edits. A longer difference is not the anchor.
+const ANCHOR_MAX_EDITS = 2;
+
+const ANCHOR_PREFIX = new Map<string, string>([
+  [SETUP_TOKEN_BEFORE_ANCHOR, "Your OAu"],
+  [SETUP_TOKEN_AFTER_ANCHOR, "Store this token securely."],
+]);
+
+function withinEdits(left: string, right: string, maxEdits: number): boolean {
+  if (Math.abs(left.length - right.length) > maxEdits) return false;
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= left.length; i += 1) {
+    const current = [i];
+    let rowMin = i;
+    for (let j = 1; j <= right.length; j += 1) {
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      const value = Math.min(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + cost);
+      current[j] = value;
+      if (value < rowMin) rowMin = value;
+    }
+    if (rowMin > maxEdits) return false;
+    previous = current;
+  }
+  return previous[right.length] <= maxEdits;
+}
+
+function matchesAnchor(line: string, anchor: string): boolean {
+  if (line === anchor) return true;
+  const prefix = ANCHOR_PREFIX.get(anchor);
+  if (!prefix || !line.startsWith(prefix)) return false;
+  return withinEdits(line, anchor, ANCHOR_MAX_EDITS);
+}
+
 /**
- * Returns the index of the one line that equals `anchor` after a trim. Returns
- * null when no line matches. Returns null when more than one line matches, so a
- * duplicate success block fails closed.
+ * Returns the index of the one line that matches `anchor` after a trim. An
+ * exact line matches. A line also matches when it keeps the anchor prefix and
+ * is within {@link ANCHOR_MAX_EDITS} single-character edits, which is the
+ * damage a differential redraw leaves. Returns null when no line matches.
+ * Returns null when more than one line matches, so a duplicate success block
+ * fails closed.
  */
 function singleAnchorIndex(lines: string[], anchor: string): number | null {
   let found: number | null = null;
   for (let i = 0; i < lines.length; i += 1) {
-    if (lines[i].trim() !== anchor) continue;
+    if (!matchesAnchor(lines[i].trim(), anchor)) continue;
     if (found !== null) return null;
     found = i;
   }
@@ -489,18 +697,8 @@ function singleAnchorIndex(lines: string[], anchor: string): number | null {
  * shape. It never logs any input byte and never puts any input byte into a
  * thrown error. The parser is a pure function.
  */
-export function parseSetupTokenCredential(text: string): string | null {
-  if (typeof text !== "string" || text.length === 0) return null;
-  const clean = stripTerminalControls(text);
-  // Canonicalize the record delimiter. The real terminal redraw joins the
-  // before-anchor line, the token, and the after-anchor line with a bare
-  // carriage return, or a CRLF pair, instead of a line feed. Map each CRLF and
-  // each bare carriage return to one line feed, so each anchor line and each
-  // token fragment lands on its own line. This step changes the record
-  // delimiter only. It cannot add a token byte, and the interval validation
-  // below still rejects partial, extra, or prose data.
-  const normalized = clean.replace(/\r\n|\r/g, "\n");
-  const lines = normalized.split("\n");
+function credentialFromPlain(clean: string): string | null {
+  const lines = clean.split("\n");
 
   const beforeIndex = singleAnchorIndex(lines, SETUP_TOKEN_BEFORE_ANCHOR);
   const afterIndex = singleAnchorIndex(lines, SETUP_TOKEN_AFTER_ANCHOR);
@@ -522,4 +720,16 @@ export function parseSetupTokenCredential(text: string): string | null {
   const token = fragments.join("");
   if (!FULL_TOKEN_RE.test(token)) return null;
   return token;
+}
+
+export function parseSetupTokenCredential(text: string): string | null {
+  if (typeof text !== "string" || text.length === 0) return null;
+  // Try the rendered screen first. Fall back to the linear control strip, and
+  // map a bare carriage return to a line feed, because some success records use
+  // that byte as the line delimiter. Neither path can add a token byte.
+  for (const clean of plainLoginText(text)) {
+    const token = credentialFromPlain(clean);
+    if (token) return token;
+  }
+  return null;
 }

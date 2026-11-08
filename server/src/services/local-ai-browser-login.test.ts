@@ -212,6 +212,76 @@ describe.skipIf(process.platform === "win32")("local browser subscription login"
     expect((await stat(path.join(home, ".credentials.json"))).mode & 0o777).toBe(0o600);
   });
 
+  it("sizes the PTY before exec and records onboarding without a trust decision", async () => {
+    vi.stubEnv("TERM", "xterm-256color");
+    vi.stubEnv("TMUX", "stale");
+    const home = await fakeCli("claude", [
+      'python3 -c \'import fcntl,struct,termios,os; print("%s %s" % struct.unpack("HHHH", fcntl.ioctl(0, termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0)))[:2], end="")\' > "$CLAUDE_CONFIG_DIR/size"',
+      'if [ -n "${TERM+x}${TMUX+x}${COLORTERM+x}" ]; then echo set > "$CLAUDE_CONFIG_DIR/term"; else echo unset > "$CLAUDE_CONFIG_DIR/term"; fi',
+      'printf "%s" "$CLAUDE_CODE_DISABLE_MOUSE" > "$CLAUDE_CONFIG_DIR/mouse"',
+      'printf "Browser didn\'t open? Use the url below to sign in (c to copy)\\n"',
+      'printf "https://claude.com/cai/oauth/authorize?client_id=cid&code=abcdefgh&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&redirect_uri=https%%3A%%2F%%2Fplatform.claude.com%%2Foauth%%2Fcode%%2Fcallback&response_type=code&scope=user&state=0123456789abcdef\\n"',
+      'printf "Paste code here if prompted >\\n"',
+      "read -r entered",
+    ].join("\n"));
+    const login = startLocalBrowserLogin("anthropic", home);
+    try {
+      await vi.waitFor(() => expect(login.authorizationUrl).toContain("https://claude.com/cai/oauth/authorize"), { timeout: 5000 });
+      expect(await readFile(path.join(home, "size"), "utf8")).toBe("40 120");
+      expect(await readFile(path.join(home, "term"), "utf8")).toBe("unset\n");
+      expect(await readFile(path.join(home, "mouse"), "utf8")).toBe("1");
+      const config = JSON.parse(await readFile(path.join(home, ".claude.json"), "utf8"));
+      expect(config).toEqual({ hasCompletedOnboarding: true });
+      expect(JSON.stringify(config)).not.toContain("hasTrustDialogAccepted");
+      expect((await stat(path.join(home, ".claude.json"))).mode & 0o777).toBe(0o600);
+    } finally { login.abort(); }
+  });
+
+  it("leaves an existing isolated Claude config untouched", async () => {
+    const home = await fakeCli("claude", "exit 0");
+    await writeFile(path.join(home, ".claude.json"), `${JSON.stringify({ hasCompletedOnboarding: false })}\n`, { mode: 0o600 });
+    const login = startLocalBrowserLogin("anthropic", home);
+    await vi.waitFor(() => expect(login.outcome).toBe("failure"), { timeout: 5000 });
+    expect(JSON.parse(await readFile(path.join(home, ".claude.json"), "utf8"))).toEqual({ hasCompletedOnboarding: false });
+  });
+
+  it("stops on a folder-trust screen without accepting it or showing a link", async () => {
+    const home = await fakeCli("claude", [
+      'printf "Quick safety check\\n"',
+      'printf "Is this a project you created or one you trust?\\n"',
+      "read -r entered",
+    ].join("\n"));
+    const login = startLocalBrowserLogin("anthropic", home);
+    await vi.waitFor(() => expect(login.outcome).toBe("failure"), { timeout: 5000 });
+    expect(login.authorizationUrl).toBeUndefined();
+    expect(login.error).toMatch(/folder trust check/);
+    expect(login.error).not.toMatch(/Quick safety check|trust this folder/);
+    const config = JSON.parse(await readFile(path.join(home, ".claude.json"), "utf8"));
+    expect(config).toEqual({ hasCompletedOnboarding: true });
+  });
+
+  it("reads a Mac copy hint and a differentially damaged success screen from the PTY", async () => {
+    const token = "sk-ant-oat01-AAAABBBBCCCCDDDDEEEE11112222FFFFGGGG_HHHH-IIII";
+    const home = await fakeCli("claude", [
+      'printf "Browser didn\'t open? Use the url below to sign in (c to copy)\\n"',
+      'printf "https://claude.com/cai/oauth/authorize?client_id=cid&code=abcdefgh&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&redirect_uri=https%%3A%%2F%%2Fplatform.claude.com%%2Foauth%%2Fcode%%2Fcallback&response_type=code&scope=user&state=0123456789abcdef\\n"',
+      'printf "Hold Fn while selecting to use your terminal\'s native\\n"',
+      'printf "copy\\n"',
+      'printf "Paste code here if prompted >\\n"',
+      "read -r entered",
+      'printf "Your OAuh token (valid for 1 yer):\\n"',
+      `printf '%s\\n' '${token}'`,
+      'printf "Store this token securely. You w n\'t be able to see it again.\\n"',
+    ].join("\n"));
+    const login = startLocalBrowserLogin("anthropic", home);
+    await vi.waitFor(() => expect(login.authorizationUrl).toContain("https://claude.com/cai/oauth/authorize"), { timeout: 5000 });
+    login.submitCode?.("fixture-code");
+    await vi.waitFor(() => expect(login.outcome).toBe("success"), { timeout: 5000 });
+    const credential = JSON.parse(await readFile(path.join(home, ".credentials.json"), "utf8"));
+    expect(credential.claudeAiOauth.accessToken).toBe(token);
+    expect((await stat(path.join(home, ".credentials.json"))).mode & 0o777).toBe(0o600);
+  });
+
   it("terminates the local provider process when sign-in is cancelled", async () => {
     const home = await fakeCli("codex", 'echo $$ > "$CODEX_HOME/login.pid"\nexec sleep 60');
     const login = startLocalBrowserLogin("openai", home);
