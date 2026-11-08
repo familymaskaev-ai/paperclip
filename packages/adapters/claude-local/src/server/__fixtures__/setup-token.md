@@ -89,9 +89,13 @@ normalized capture hid. The parser now handles both:
    together. The parser now renders each horizontal-move sequence as one space.
 2. Repeated URL. The UI emits one OSC 8 hyperlink per wrapped display row, so it
    repeats the full authorization URL on a few consecutive lines before the
-   prompt. The parser now skips a repeated URL line and binds the prompt on the
-   first non-blank line after the URL block; any other unrelated line still fails
-   the bind.
+   prompt. The parser now skips a repeated URL line and a native-copy hint.
+   The hint text is `Hold Shift while selecting to use your terminal's native copy`,
+   and the same sentence with `Fn`, `Option`, or `Opt` in place of `Shift`.
+   A wrap that puts `copy` on the next physical line is still that hint.
+   The parser binds the prompt on the first remaining non-blank line. Any other
+   unrelated line still fails the bind. These hint shapes are synthetic fixtures.
+   They are not a new live capture.
 
 The success anchors and the token shape were not re-run live, because a real
 login needs a subscription and an out-of-band browser. They stay as recorded in
