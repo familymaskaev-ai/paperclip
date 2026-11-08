@@ -10,6 +10,7 @@ import {
   SETUP_TOKEN_PROMPT,
   SETUP_TOKEN_REDIRECT_URI,
   SETUP_TOKEN_URL_QUERY_KEYS,
+  classifySetupTokenBlocker,
   parseSetupTokenCredential,
   parseSetupTokenPrompt,
 } from "./setup-token-parse.js";
@@ -343,6 +344,35 @@ describe("parseSetupTokenPrompt", () => {
     const result = parseSetupTokenPrompt(text);
     expect(result?.url).toBe(CLAUDE_COM_URL);
     expect(result?.prompt).toBe(SETUP_TOKEN_PROMPT);
+  });
+
+  it.each(["Shift", "Fn", "Option", "Opt"])("skips a %s native-copy hint between the URL and the prompt", (key) => {
+    const hint = `Hold ${key} while selecting to use your terminal's native copy`;
+    const text = [PREAMBLE_LINE, CLAUDE_COM_URL, "", hint, "", PROMPT_LINE].join("\n");
+    const result = parseSetupTokenPrompt(text);
+    expect(result?.url).toBe(CLAUDE_COM_URL);
+    expect(result?.prompt).toBe(SETUP_TOKEN_PROMPT);
+  });
+
+  it("does not treat a folder-trust screen as a sign-in prompt", () => {
+    const text = [
+      "Quick safety check",
+      "Is this a project you created or one you trust?",
+      "1. Yes, I trust this folder",
+      "2. No",
+    ].join("\n");
+    expect(parseSetupTokenPrompt(text)).toBeNull();
+    expect(classifySetupTokenBlocker(text)).toBe("workspace_trust");
+  });
+
+  it("does not treat the first-run theme screen as a sign-in prompt", () => {
+    const text = "Choose the text style that looks best\n1. Dark\n2. Light\n";
+    expect(parseSetupTokenPrompt(text)).toBeNull();
+    expect(classifySetupTokenBlocker(text)).toBe("first_run_onboarding");
+  });
+
+  it("keeps a valid prompt ahead of a blocking-screen phrase", () => {
+    expect(classifySetupTokenBlocker(completeOutput(CLAUDE_COM_URL))).toBeNull();
   });
 
   it("returns null when a code-like value sits on the line after the URL", () => {

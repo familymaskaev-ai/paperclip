@@ -36,6 +36,7 @@ export {
 export {
   parseSetupTokenPrompt,
   parseSetupTokenCredential,
+  classifySetupTokenBlocker,
   SETUP_TOKEN_PROMPT,
   SETUP_TOKEN_AUTH_URLS,
   SETUP_TOKEN_REDIRECT_URI,
@@ -44,7 +45,7 @@ export {
   SETUP_TOKEN_BEFORE_ANCHOR,
   SETUP_TOKEN_AFTER_ANCHOR,
 } from "./setup-token-parse.js";
-export type { SetupTokenPrompt } from "./setup-token-parse.js";
+export type { SetupTokenPrompt, SetupTokenBlocker } from "./setup-token-parse.js";
 // The Claude `setup-token` login runner. A server-side factory binds it to a
 // sandbox pseudo-terminal driver to drive the two-way login round-trip and to
 // deliver the minted token one time in memory.

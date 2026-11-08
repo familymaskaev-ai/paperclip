@@ -181,9 +181,12 @@ const URL_PREAMBLE_RE = /the url below to sign in/i;
 // the line.
 const PROMPT_LINE_RE = /^Paste code here if prompted\b[\s>*]*$/;
 
-// The copy hint that `claude` 2.1.291 prints between the URL block and the
-// prompt. The parser skips this exact line and binds no value from it.
-const COPY_HINT_LINE_RE = /^Hold\s+Shift\s+while\s+selecting\s+to\s+use\s+your\s+terminal['’]s\s+native\s+copy\.?$/i;
+// The copy hint Claude Code prints between the URL block and the prompt.
+// Linux builds say "Hold Shift". macOS builds of the same flow say "Hold Fn"
+// or "Hold Option". The parser skips this exact line and binds no value from
+// it. Any other line still fails closed.
+const COPY_HINT_LINE_RE =
+  /^Hold\s+(?:Shift|Fn|Option|Opt)\s+while\s+selecting\s+to\s+use\s+your\s+terminal['’]s\s+native\s+copy\.?$/i;
 
 // The maximum number of characters between the end of the URL preamble line and
 // the start of the URL. The Claude UI prints the URL right after the preamble.
@@ -425,6 +428,27 @@ export function parseSetupTokenPrompt(text: string): SetupTokenPrompt | null {
     const prompt = findBrowserCodePrompt(lines, match.endLine, match.url);
     if (prompt) return { url: match.url, prompt };
   }
+  return null;
+}
+
+// A fresh Claude home can stop on one of these screens before it prints a URL.
+// The classifier returns a fixed kind. It never returns the screen text.
+export type SetupTokenBlocker = "workspace_trust" | "first_run_onboarding";
+
+const WORKSPACE_TRUST_RE = /Quick safety check|Is this a project you created or one you trust/i;
+const FIRST_RUN_ONBOARDING_RE = /Choose the text style that looks best/i;
+
+/**
+ * Classifies a login transcript that has not produced a sign-in URL. Returns
+ * null when the transcript holds a valid prompt, or when it does not match a
+ * known blocking screen. Never returns transcript text.
+ */
+export function classifySetupTokenBlocker(text: string): SetupTokenBlocker | null {
+  if (typeof text !== "string" || text.length === 0) return null;
+  if (parseSetupTokenPrompt(text)) return null;
+  const plain = stripTerminalControls(text);
+  if (WORKSPACE_TRUST_RE.test(plain)) return "workspace_trust";
+  if (FIRST_RUN_ONBOARDING_RE.test(plain)) return "first_run_onboarding";
   return null;
 }
 
